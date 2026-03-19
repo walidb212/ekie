@@ -15,6 +15,8 @@ logger = logging.getLogger("ekie.retriever")
 COLLECTION_NAME = "legal_fr"
 EMBED_MODEL = "gemini-embedding-2-preview"
 VECTOR_SIZE = 768
+MIN_PERTINENCE = 0.72
+SEARCH_LIMIT_MULTIPLIER = 3
 
 
 def _normalize(v: list[float]) -> list[float]:
@@ -103,13 +105,18 @@ def retrieve_legal_context(
         logger.info("Qdrant filter: NONE (confiance=%.0f%% <= 70%% or domaine='autre')", confiance * 100)
 
     # Query Qdrant
-    logger.info("Querying Qdrant collection '%s' for top %d...", COLLECTION_NAME, n)
+    search_limit = max(n, n * SEARCH_LIMIT_MULTIPLIER)
+    logger.info(
+        "Querying Qdrant collection '%s' for top %d candidates...",
+        COLLECTION_NAME,
+        search_limit,
+    )
     t0 = time.perf_counter()
     search_result = qdrant_client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         query_filter=query_filter,
-        limit=n,
+        limit=search_limit,
         with_payload=True,
     )
     qdrant_ms = int((time.perf_counter() - t0) * 1000)
@@ -125,7 +132,24 @@ def retrieve_legal_context(
             "texte": texte,
         })
 
-    logger.info("Qdrant returned %d results in %dms", len(documents), qdrant_ms)
+    raw_count = len(documents)
+    documents = [doc for doc in documents if doc["pertinence"] >= MIN_PERTINENCE]
+    dropped_count = raw_count - len(documents)
+    if dropped_count:
+        logger.info(
+            "Dropped %d low-pertinence docs (< %.2f)",
+            dropped_count,
+            MIN_PERTINENCE,
+        )
+
+    documents = documents[:n]
+
+    logger.info(
+        "Qdrant returned %d relevant results in %dms (%d raw)",
+        len(documents),
+        qdrant_ms,
+        raw_count,
+    )
     for i, doc in enumerate(documents, 1):
         logger.info(
             "  #%d  score=%.4f  src=%s  (%d chars)",

@@ -1,52 +1,121 @@
-"""Conversational engine — guides the user through clarifying questions before generating a brief."""
+"""Conversational engine that asks clarifying questions before generating a brief."""
 
-import json
 import logging
-import os
+import re
 import time
+import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from google import genai
 from google.genai import types
 
+from api.brief_generator import generate_brief
 from api.classifier import classify_question
 from api.retriever import embed_query, retrieve_legal_context
-from api.brief_generator import generate_brief
-from api.models import ChatMessage
 
 logger = logging.getLogger("ekie.conversation")
 
 # In-memory conversation store (swap for Redis in prod)
 _conversations: dict[str, dict] = {}
 
-SUMMARY_PROMPT = """Résume cette conversation juridique en UNE phrase claire qui capture le problème du salarié, les faits et le contexte.
+MIN_USER_MESSAGES_FOR_BRIEF = 4
+DETAILED_FIRST_MESSAGE_CHARS = 200
+
+NON_SUBSTANTIVE_REPLY = (
+    "J'ai besoin d'un peu plus de contexte. Decris brievement le probleme "
+    "juridique : ce qu'il s'est passe, avec qui, et si possible quand."
+)
+
+GREETING_PATTERNS = (
+    re.compile(r"^h[eai]?l{1,2}o+$"),
+    re.compile(r"^hey+$"),
+    re.compile(r"^yo+$"),
+    re.compile(r"^bonjou+r+$"),
+    re.compile(r"^salu+t+$"),
+    re.compile(r"^coucou+$"),
+)
+
+GREETING_TOKENS = {
+    "bjr",
+    "bonjour",
+    "bonsoir",
+    "cc",
+    "coucou",
+    "hello",
+    "hey",
+    "salut",
+    "yo",
+}
+FILLER_TOKENS = {
+    "aide",
+    "help",
+    "merci",
+    "ok",
+    "okok",
+    "oki",
+    "please",
+    "stp",
+    "svp",
+    "test",
+}
+LEGAL_SIGNAL_TOKENS = {
+    "agression",
+    "amende",
+    "arnaque",
+    "bijou",
+    "bijoux",
+    "caution",
+    "contrat",
+    "divorce",
+    "employeur",
+    "expulsion",
+    "facture",
+    "garde",
+    "harcelement",
+    "impot",
+    "licencie",
+    "loyer",
+    "plainte",
+    "preavis",
+    "salaire",
+    "succession",
+    "travail",
+    "vol",
+    "vole",
+    "volee",
+}
+
+SUMMARY_PROMPT = """Resume cette conversation juridique en UNE phrase claire qui capture le probleme du salarie, les faits et le contexte.
 
 Conversation :
 {history}
 
-Résumé en une phrase :"""
+Resume en une phrase :"""
 
-NEXT_QUESTION_PROMPT = """Tu es un assistant juridique français. Tu poses des questions de clarification courtes et précises pour comprendre la situation juridique du salarié.
+NEXT_QUESTION_PROMPT = """Tu es un assistant juridique francais. Tu poses des questions de clarification courtes et precises pour comprendre la situation juridique du salarie.
 
 Conversation :
 {history}
 
-Domaine détecté : {domaine} / {sous_domaine}
+Domaine detecte : {domaine} / {sous_domaine}
 
-Questions déjà posées (NE PAS RÉPÉTER) :
+Questions deja posees (NE PAS REPETER) :
 {asked}
 
-Règles :
-- Pose UNE SEULE question courte et précise
-- Ne répète jamais une question déjà posée
-- Concentre-toi sur : les faits, les dates, les preuves, les démarches déjà faites
+Regles :
+- Pose UNE SEULE question courte et precise
+- Ne repete jamais une question deja posee
+- Concentre-toi sur : les faits, les dates, les preuves, les demarches deja faites
 - Sois empathique mais professionnel
-- Réponds directement avec la question, sans introduction
+- Reponds directement avec la question, sans introduction
 
 Question :"""
 
-GREETING = "Bonjour, je suis l'assistant juridique Ekie. Décrivez votre situation, je vous poserai quelques questions avant de générer un brief pour votre avocat."
+GREETING = (
+    "Bonjour, je suis l'assistant juridique Ekie. Decrivez votre situation, "
+    "je vous poserai quelques questions avant de generer un brief pour votre avocat."
+)
 
 
 def get_conversation(conversation_id: str | None) -> tuple[str, dict]:
@@ -71,13 +140,44 @@ def _format_history(messages: list[dict]) -> str:
     """Format messages for prompts."""
     lines = []
     for msg in messages:
-        role = "Salarié" if msg["role"] == "user" else "Assistant"
+        role = "Salarie" if msg["role"] == "user" else "Assistant"
         lines.append(f"{role} : {msg['content']}")
     return "\n".join(lines)
 
 
+def _normalize_text(text: str) -> str:
+    """Normalize text for lightweight message-quality heuristics."""
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized.lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_greeting_token(token: str) -> bool:
+    """Detect simple greeting variants, including elongated spellings."""
+    return token in GREETING_TOKENS or any(pattern.fullmatch(token) for pattern in GREETING_PATTERNS)
+
+
+def _is_meaningful_user_message(message: str) -> bool:
+    """Ignore greetings and filler messages so they do not count toward the brief."""
+    normalized = _normalize_text(message)
+    if not normalized:
+        return False
+
+    tokens = normalized.split()
+    if len(tokens) <= 3 and all(_is_greeting_token(token) or token in FILLER_TOKENS for token in tokens):
+        return False
+
+    if len(normalized) < 12 and not any(token in LEGAL_SIGNAL_TOKENS for token in tokens):
+        return False
+
+    if len(tokens) == 1 and len(tokens[0]) <= 3 and tokens[0] not in LEGAL_SIGNAL_TOKENS:
+        return False
+
+    return True
+
+
 def _summarize(messages: list[dict], gemini_client: genai.Client) -> str:
-    """Summarize conversation into a single sentence for classification + retrieval."""
+    """Summarize conversation into a single sentence for classification and retrieval."""
     history = _format_history(messages)
     prompt = SUMMARY_PROMPT.format(history=history)
 
@@ -109,8 +209,8 @@ def _generate_next_question(
 
     prompt = NEXT_QUESTION_PROMPT.format(
         history=history,
-        domaine=domaine or "non détecté",
-        sous_domaine=sous_domaine or "non détecté",
+        domaine=domaine or "non detecte",
+        sous_domaine=sous_domaine or "non detecte",
         asked=asked,
     )
 
@@ -125,23 +225,32 @@ def _generate_next_question(
         ),
     )
     question = response.text.strip()
-    logger.info("Next question generated in %dms: \"%s\"", (time.perf_counter() - t0) * 1000, question[:100])
+    logger.info(
+        "Next question generated in %dms: \"%s\"",
+        (time.perf_counter() - t0) * 1000,
+        question[:100],
+    )
     return question
 
 
 def _should_generate_brief(state: dict) -> bool:
     """Decide if we have enough info to generate the brief."""
-    user_messages = [m for m in state["messages"] if m["role"] == "user"]
-    total_user_chars = sum(len(m["content"]) for m in user_messages)
+    user_messages = [message for message in state["messages"] if message["role"] == "user"]
+    total_user_chars = sum(len(message["content"]) for message in user_messages)
 
-    # Generate brief if:
-    # 1. High confidence + at least 3 user messages (after 2 bot questions)
-    # 2. Or user provided a very detailed first message (>200 chars) with high confidence
-    # 3. Or we've asked 4+ questions already (don't over-ask)
-    if state["confiance"] >= 0.85 and len(user_messages) >= 3:
-        logger.info("Brief ready: confiance=%.0f%% >= 85%% and %d user messages", state["confiance"] * 100, len(user_messages))
+    # Keep one more question in the loop by default so the brief has enough factual detail.
+    if state["confiance"] >= 0.85 and len(user_messages) >= MIN_USER_MESSAGES_FOR_BRIEF:
+        logger.info(
+            "Brief ready: confiance=%.0f%% >= 85%% and %d substantive user messages",
+            state["confiance"] * 100,
+            len(user_messages),
+        )
         return True
-    if len(user_messages) == 1 and total_user_chars > 200 and state["confiance"] >= 0.85:
+    if (
+        len(user_messages) == 1
+        and total_user_chars > DETAILED_FIRST_MESSAGE_CHARS
+        and state["confiance"] >= 0.85
+    ):
         logger.info("Brief ready: detailed first message (%d chars) with high confidence", total_user_chars)
         return True
     if len(state["questions_asked"]) >= 4:
@@ -150,7 +259,10 @@ def _should_generate_brief(state: dict) -> bool:
 
     logger.info(
         "Not ready yet: confiance=%.0f%%, user_msgs=%d, chars=%d, questions_asked=%d",
-        state["confiance"] * 100, len(user_messages), total_user_chars, len(state["questions_asked"]),
+        state["confiance"] * 100,
+        len(user_messages),
+        total_user_chars,
+        len(state["questions_asked"]),
     )
     return False
 
@@ -162,24 +274,29 @@ def process_message(
     qdrant_client=None,
     mistral_client=None,
 ) -> dict:
-    """Process a user message in the conversation flow.
-
-    Returns dict with: conversation_id, action, message/brief, domaine, confiance.
-    """
+    """Process a user message in the conversation flow."""
     cid, state = get_conversation(conversation_id)
+    cleaned_message = user_message.strip()
 
-    # Add user message
-    state["messages"].append({"role": "user", "content": user_message})
-    logger.info("─── Conversation %s — message #%d ───", cid, len(state["messages"]))
-    logger.info("User: \"%s\"", user_message[:100])
+    if not _is_meaningful_user_message(cleaned_message):
+        logger.info("Ignoring non-substantive user message in conversation %s: %r", cid, user_message)
+        return {
+            "conversation_id": cid,
+            "action": "question",
+            "message": NON_SUBSTANTIVE_REPLY,
+            "domaine": state["domaine"],
+            "confiance": state["confiance"],
+        }
 
-    # Summarize conversation for classification
+    state["messages"].append({"role": "user", "content": cleaned_message})
+    logger.info("--- Conversation %s - message #%d ---", cid, len(state["messages"]))
+    logger.info("User: \"%s\"", cleaned_message[:100])
+
     if len(state["messages"]) == 1:
-        summary = user_message
+        summary = cleaned_message
     else:
         summary = _summarize(state["messages"], gemini_client)
 
-    # Classify + embed in parallel
     with ThreadPoolExecutor(max_workers=2) as pool:
         cls_fut = pool.submit(classify_question, summary, gemini_client)
         emb_fut = pool.submit(embed_query, summary, gemini_client)
@@ -199,9 +316,8 @@ def process_message(
         state["confiance"] * 100,
     )
 
-    # Decide: brief or next question
     if _should_generate_brief(state):
-        logger.info("→ Generating BRIEF")
+        logger.info("-> Generating BRIEF")
 
         context_docs = retrieve_legal_context(
             question=summary,
@@ -229,24 +345,23 @@ def process_message(
             "confiance": state["confiance"],
         }
 
-    else:
-        logger.info("→ Generating next QUESTION")
+    logger.info("-> Generating next QUESTION")
 
-        next_q = _generate_next_question(
-            state["messages"],
-            state["domaine"],
-            state["sous_domaine"],
-            state["questions_asked"],
-            gemini_client,
-        )
+    next_question = _generate_next_question(
+        state["messages"],
+        state["domaine"],
+        state["sous_domaine"],
+        state["questions_asked"],
+        gemini_client,
+    )
 
-        state["questions_asked"].append(next_q)
-        state["messages"].append({"role": "assistant", "content": next_q})
+    state["questions_asked"].append(next_question)
+    state["messages"].append({"role": "assistant", "content": next_question})
 
-        return {
-            "conversation_id": cid,
-            "action": "question",
-            "message": next_q,
-            "domaine": state["domaine"],
-            "confiance": state["confiance"],
-        }
+    return {
+        "conversation_id": cid,
+        "action": "question",
+        "message": next_question,
+        "domaine": state["domaine"],
+        "confiance": state["confiance"],
+    }

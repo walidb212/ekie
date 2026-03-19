@@ -57,6 +57,43 @@ class TestRetrieveLegalContext:
         assert results[0]["source"] == "Code du travail"
 
     @patch("api.retriever.np")
+    def test_filters_low_pertinence_results(self, mock_np):
+        """Test that weak references are dropped before returning results."""
+        mock_np.array.return_value = MagicMock()
+        mock_np.linalg.norm.return_value = 1.0
+        mock_np.array.return_value.__truediv__ = MagicMock(return_value=MagicMock(tolist=MagicMock(return_value=[0.1] * 768)))
+
+        mock_qdrant = MagicMock()
+        mock_gemini = MagicMock()
+
+        mock_embedding = MagicMock()
+        mock_embedding.values = [0.1] * 768
+        mock_embed_result = MagicMock()
+        mock_embed_result.embeddings = [mock_embedding]
+        mock_gemini.models.embed_content.return_value = mock_embed_result
+
+        mock_search_result = MagicMock()
+        mock_search_result.points = [
+            _make_scored_point("1", 0.91, {"text": "Article pertinent", "source": "Source fiable"}),
+            _make_scored_point("2", 0.72, {"text": "Decision pertinente", "source": "Decision solide"}),
+            _make_scored_point("3", 0.60, {"text": "Decision hors sujet", "source": "Reference douteuse"}),
+        ]
+        mock_qdrant.query_points.return_value = mock_search_result
+
+        results = retrieve_legal_context(
+            question="On m'a vole des bijoux",
+            domaine="penal",
+            confiance=0.9,
+            n=3,
+            qdrant_client=mock_qdrant,
+            gemini_client=mock_gemini,
+        )
+
+        assert len(results) == 2
+        assert all(result["pertinence"] >= 0.72 for result in results)
+        assert all(result["source"] != "Reference douteuse" for result in results)
+
+    @patch("api.retriever.np")
     def test_returns_empty_on_no_results(self, mock_np):
         """Test empty list when Qdrant returns no results."""
         mock_np.array.return_value = MagicMock()
