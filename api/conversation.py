@@ -176,6 +176,19 @@ def _is_meaningful_user_message(message: str) -> bool:
     return True
 
 
+def _is_useful_follow_up_answer(message: str) -> bool:
+    """Allow short follow-up answers once the assistant has asked a real question."""
+    normalized = _normalize_text(message)
+    if not normalized:
+        return False
+
+    tokens = normalized.split()
+    if all(_is_greeting_token(token) or token in FILLER_TOKENS for token in tokens):
+        return False
+
+    return True
+
+
 def _summarize(messages: list[dict], gemini_client: genai.Client) -> str:
     """Summarize conversation into a single sentence for classification and retrieval."""
     history = _format_history(messages)
@@ -277,8 +290,11 @@ def process_message(
     """Process a user message in the conversation flow."""
     cid, state = get_conversation(conversation_id)
     cleaned_message = user_message.strip()
+    has_follow_up_context = bool(state["questions_asked"])
 
-    if not _is_meaningful_user_message(cleaned_message):
+    if not _is_meaningful_user_message(cleaned_message) and not (
+        has_follow_up_context and _is_useful_follow_up_answer(cleaned_message)
+    ):
         logger.info("Ignoring non-substantive user message in conversation %s: %r", cid, user_message)
         return {
             "conversation_id": cid,

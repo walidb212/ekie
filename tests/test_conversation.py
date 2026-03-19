@@ -36,6 +36,70 @@ class TestConversation:
         """Short but legally meaningful messages should still count."""
         assert _is_meaningful_user_message("vol")
 
+    @patch("api.conversation._generate_next_question")
+    @patch("api.conversation.embed_query")
+    @patch("api.conversation.classify_question")
+    def test_short_follow_up_answers_are_accepted(
+        self,
+        mock_classify,
+        mock_embed,
+        mock_next_question,
+    ):
+        """Short answers like 'non' or 'Paris' should not be rejected mid-conversation."""
+        mock_classify.return_value = {
+            "domaine": "penal",
+            "domaine_secondaire": None,
+            "sous_domaine": "vol",
+            "confiance": 0.93,
+        }
+        mock_embed.return_value = [0.1] * 768
+        mock_next_question.side_effect = [
+            "Avez-vous depose plainte ?",
+            "Ou le vol a-t-il eu lieu ?",
+            "Quel est le montant estime ?",
+        ]
+
+        first = process_message(None, "Je me suis fait voler des bijoux avant-hier.", MagicMock())
+        second = process_message(first["conversation_id"], "non", MagicMock())
+        third = process_message(second["conversation_id"], "Paris", MagicMock())
+
+        assert first["message"] == "Avez-vous depose plainte ?"
+        assert second["message"] == "Ou le vol a-t-il eu lieu ?"
+        assert third["message"] == "Quel est le montant estime ?"
+
+        state = _conversations[first["conversation_id"]]
+        user_messages = [message["content"] for message in state["messages"] if message["role"] == "user"]
+        assert user_messages == [
+            "Je me suis fait voler des bijoux avant-hier.",
+            "non",
+            "Paris",
+        ]
+
+    @patch("api.conversation._generate_next_question")
+    @patch("api.conversation.embed_query")
+    @patch("api.conversation.classify_question")
+    def test_greeting_reply_is_still_ignored_mid_conversation(
+        self,
+        mock_classify,
+        mock_embed,
+        mock_next_question,
+    ):
+        """A follow-up greeting should still be treated as noise."""
+        mock_classify.return_value = {
+            "domaine": "penal",
+            "domaine_secondaire": None,
+            "sous_domaine": "vol",
+            "confiance": 0.93,
+        }
+        mock_embed.return_value = [0.1] * 768
+        mock_next_question.return_value = "Avez-vous depose plainte ?"
+
+        first = process_message(None, "Je me suis fait voler des bijoux avant-hier.", MagicMock())
+        second = process_message(first["conversation_id"], "hello", MagicMock())
+
+        assert second["action"] == "question"
+        assert "contexte" in second["message"]
+
     def test_requires_four_substantive_user_messages_for_brief(self):
         """Three short substantive messages should not trigger the brief yet."""
         state = {
