@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.example
+__pycache__
+*.pyc
+*.pyo
+tests/
+frontend/
+*.md
+.dockerignore
+docker-compose.yml
+cloudbuild.yaml
