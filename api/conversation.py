@@ -21,6 +21,9 @@ _conversations: dict[str, dict] = {}
 
 MIN_USER_MESSAGES_FOR_BRIEF = 4
 DETAILED_FIRST_MESSAGE_CHARS = 200
+MIN_USER_MESSAGES_FOR_EARLY_BRIEF = 3
+MIN_QUESTIONS_FOR_EARLY_BRIEF = 2
+MIN_TOTAL_CHARS_FOR_EARLY_BRIEF = 80
 
 NON_SUBSTANTIVE_REPLY = (
     "J'ai besoin d'un peu plus de contexte. Decris brievement le probleme "
@@ -257,6 +260,20 @@ def _should_generate_brief(state: dict) -> bool:
             "Brief ready: confiance=%.0f%% >= 85%% and %d substantive user messages",
             state["confiance"] * 100,
             len(user_messages),
+        )
+        return True
+    if (
+        state["confiance"] >= 0.85
+        and len(user_messages) >= MIN_USER_MESSAGES_FOR_EARLY_BRIEF
+        and len(state["questions_asked"]) >= MIN_QUESTIONS_FOR_EARLY_BRIEF
+        and total_user_chars >= MIN_TOTAL_CHARS_FOR_EARLY_BRIEF
+    ):
+        logger.info(
+            "Brief ready early: confiance=%.0f%%, user_msgs=%d, chars=%d, questions_asked=%d",
+            state["confiance"] * 100,
+            len(user_messages),
+            total_user_chars,
+            len(state["questions_asked"]),
         )
         return True
     if (

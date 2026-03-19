@@ -15,8 +15,18 @@ logger = logging.getLogger("ekie.retriever")
 COLLECTION_NAME = "legal_fr"
 EMBED_MODEL = "gemini-embedding-2-preview"
 VECTOR_SIZE = 768
-MIN_PERTINENCE = 0.72
 SEARCH_LIMIT_MULTIPLIER = 3
+FALLBACK_RESULT_COUNT = 2
+DEFAULT_MIN_PERTINENCE = 0.70
+MIN_PERTINENCE_BY_DOMAINE = {
+    "travail": 0.72,
+    "immobilier": 0.72,
+    "famille": 0.70,
+    "penal": 0.60,
+    "fiscal": 0.65,
+    "consommation": 0.70,
+    "societe": 0.70,
+}
 
 
 def _normalize(v: list[float]) -> list[float]:
@@ -26,6 +36,68 @@ def _normalize(v: list[float]) -> list[float]:
     if norm > 0:
         arr = arr / norm
     return arr.tolist()
+
+
+def _min_pertinence_for_domaine(domaine: str | None) -> float:
+    """Return the relevance threshold adapted to the legal domain."""
+    if not domaine:
+        return DEFAULT_MIN_PERTINENCE
+    return MIN_PERTINENCE_BY_DOMAINE.get(domaine, DEFAULT_MIN_PERTINENCE)
+
+
+def _query_qdrant_candidates(
+    qdrant_client: QdrantClient,
+    query_vector: list[float],
+    query_filter: Filter | None,
+    n: int,
+) -> tuple[list[dict], int]:
+    """Query Qdrant and return raw candidates with their payloads."""
+    search_limit = max(n, n * SEARCH_LIMIT_MULTIPLIER)
+    logger.info(
+        "Querying Qdrant collection '%s' for top %d candidates...",
+        COLLECTION_NAME,
+        search_limit,
+    )
+    t0 = time.perf_counter()
+    search_result = qdrant_client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        query_filter=query_filter,
+        limit=search_limit,
+        with_payload=True,
+    )
+    qdrant_ms = int((time.perf_counter() - t0) * 1000)
+
+    documents = []
+    for point in search_result.points:
+        payload = point.payload or {}
+        texte = payload.get("text", "")
+        documents.append({
+            "source": payload.get("source", "Unknown"),
+            "extrait": texte[:500] if texte else "",
+            "pertinence": round(point.score, 4),
+            "texte": texte,
+        })
+
+    return documents, qdrant_ms
+
+
+def _filter_documents_by_pertinence(
+    documents: list[dict],
+    threshold: float,
+    limit: int,
+) -> list[dict]:
+    """Keep only sufficiently relevant references."""
+    raw_count = len(documents)
+    documents = [doc for doc in documents if doc["pertinence"] >= threshold]
+    dropped_count = raw_count - len(documents)
+    if dropped_count:
+        logger.info(
+            "Dropped %d low-pertinence docs (< %.2f)",
+            dropped_count,
+            threshold,
+        )
+    return documents[:limit]
 
 
 def embed_query(question: str, gemini_client: genai.Client | None = None) -> list[float]:
@@ -104,45 +176,37 @@ def retrieve_legal_context(
     else:
         logger.info("Qdrant filter: NONE (confiance=%.0f%% <= 70%% or domaine='autre')", confiance * 100)
 
-    # Query Qdrant
-    search_limit = max(n, n * SEARCH_LIMIT_MULTIPLIER)
-    logger.info(
-        "Querying Qdrant collection '%s' for top %d candidates...",
-        COLLECTION_NAME,
-        search_limit,
-    )
-    t0 = time.perf_counter()
-    search_result = qdrant_client.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
+    threshold = _min_pertinence_for_domaine(domaine)
+    logger.info("Relevance threshold for domaine='%s': %.2f", domaine or "default", threshold)
+
+    documents, qdrant_ms = _query_qdrant_candidates(
+        qdrant_client=qdrant_client,
+        query_vector=query_vector,
         query_filter=query_filter,
-        limit=search_limit,
-        with_payload=True,
+        n=n,
     )
-    qdrant_ms = int((time.perf_counter() - t0) * 1000)
-
-    documents = []
-    for point in search_result.points:
-        payload = point.payload or {}
-        texte = payload.get("text", "")
-        documents.append({
-            "source": payload.get("source", "Unknown"),
-            "extrait": texte[:500] if texte else "",
-            "pertinence": round(point.score, 4),
-            "texte": texte,
-        })
-
     raw_count = len(documents)
-    documents = [doc for doc in documents if doc["pertinence"] >= MIN_PERTINENCE]
-    dropped_count = raw_count - len(documents)
-    if dropped_count:
-        logger.info(
-            "Dropped %d low-pertinence docs (< %.2f)",
-            dropped_count,
-            MIN_PERTINENCE,
-        )
+    documents = _filter_documents_by_pertinence(documents, threshold, n)
 
-    documents = documents[:n]
+    if not documents and query_filter is not None:
+        logger.info(
+            "No references survived threshold %.2f for domaine='%s'; retrying without domain filter",
+            threshold,
+            domaine,
+        )
+        fallback_documents, fallback_ms = _query_qdrant_candidates(
+            qdrant_client=qdrant_client,
+            query_vector=query_vector,
+            query_filter=None,
+            n=FALLBACK_RESULT_COUNT,
+        )
+        qdrant_ms += fallback_ms
+        raw_count += len(fallback_documents)
+        documents = _filter_documents_by_pertinence(
+            fallback_documents,
+            threshold,
+            FALLBACK_RESULT_COUNT,
+        )
 
     logger.info(
         "Qdrant returned %d relevant results in %dms (%d raw)",

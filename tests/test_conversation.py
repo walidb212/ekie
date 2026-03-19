@@ -116,6 +116,22 @@ class TestConversation:
 
         assert not _should_generate_brief(state)
 
+    def test_allows_early_brief_after_three_detailed_messages(self):
+        """Three detailed user messages should be enough once two clarifying questions were asked."""
+        state = {
+            "messages": [
+                {"role": "user", "content": "Mon employeur me paie pas depuis deux mois."},
+                {"role": "assistant", "content": "Depuis quand exactement ?"},
+                {"role": "user", "content": "Depuis janvier, il dit que la tresorerie est mauvaise."},
+                {"role": "assistant", "content": "Avez-vous des preuves ecrites ?"},
+                {"role": "user", "content": "Oui, j'ai mes bulletins et ses messages ou il reconnait le retard."},
+            ],
+            "confiance": 0.92,
+            "questions_asked": ["Depuis quand exactement ?", "Avez-vous des preuves ecrites ?"],
+        }
+
+        assert _should_generate_brief(state)
+
     @patch("api.conversation._generate_next_question")
     @patch("api.conversation.embed_query")
     @patch("api.conversation.classify_question")

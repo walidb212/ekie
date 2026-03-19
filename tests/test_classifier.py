@@ -100,3 +100,49 @@ class TestClassifyQuestion:
 
             result = classify_question("Test question", gemini_client=mock_client)
             assert result["domaine"] == domain
+
+    @patch("api.classifier.genai")
+    def test_prioritizes_family_for_post_pacs_property_dispute(self, mock_genai):
+        """Shared-property disputes after breakup should stay anchored in family law."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "domaine": "immobilier",
+            "domaine_secondaire": None,
+            "sous_domaine": "indivision",
+            "confiance": 0.76,
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        result = classify_question(
+            "Mon ex veut me reprendre l'appartement qu'on a achete ensemble apres notre PACS",
+            gemini_client=mock_client,
+        )
+
+        assert result["domaine"] == "famille"
+        assert result["domaine_secondaire"] == "immobilier"
+        assert result["sous_domaine"] == "indivision post-pacs"
+        assert result["confiance"] >= 0.9
+
+    @patch("api.classifier.genai")
+    def test_detects_work_and_penal_for_falsified_payslips(self, mock_genai):
+        """Falsified payslips should expose the travail + penal crossover."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "domaine": "travail",
+            "domaine_secondaire": None,
+            "sous_domaine": "salaire",
+            "confiance": 0.82,
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        result = classify_question(
+            "Mon patron a falsifie mes fiches de paie pour effacer mes heures supplementaires",
+            gemini_client=mock_client,
+        )
+
+        assert result["domaine"] == "travail"
+        assert result["domaine_secondaire"] == "penal"
+        assert result["sous_domaine"] == "faux et usage de faux"
+        assert result["confiance"] >= 0.9
